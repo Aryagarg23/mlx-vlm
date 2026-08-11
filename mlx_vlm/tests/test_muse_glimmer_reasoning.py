@@ -60,6 +60,52 @@ def test_strips_harmony_channel_headers_without_changing_ordinary_text():
     assert _strip_content_markers("ordinary text") == "ordinary text"
 
 
+def test_strips_the_bare_header_emitted_when_reasoning_is_skipped():
+    assert _strip_content_markers("to=user<|message|>391") == "391"
+
+
+def test_streaming_strips_a_bare_header_split_across_deltas():
+    state = ThinkingStreamState()
+    content = []
+
+    for chunk in ["to", "=user", "<|message|>", "391"]:
+        delta = state.feed(chunk)
+        if delta.content:
+            content.append(delta.content)
+
+    assert "".join(content) == "391"
+
+
+def test_text_that_only_starts_like_a_bare_header_is_released():
+    state = ThinkingStreamState()
+    content = []
+
+    for chunk in ["to", " be or not to be"]:
+        delta = state.feed(chunk)
+        if delta.content:
+            content.append(delta.content)
+
+    assert "".join(content) == "to be or not to be"
+
+
+def test_a_split_thinking_opener_still_wins_over_the_bare_header():
+    state = ThinkingStreamState(
+        thinking_start_token="to=self<|message|>", thinking_end_token="<|eom|>"
+    )
+    reasoning = []
+    content = []
+
+    for chunk in ["to=self", "<|message|>", "REASONING", "<|eom|>", "answer"]:
+        delta = state.feed(chunk)
+        if delta.reasoning:
+            reasoning.append(delta.reasoning)
+        if delta.content:
+            content.append(delta.content)
+
+    assert "".join(reasoning) == "REASONING"
+    assert "".join(content) == "answer"
+
+
 def test_build_gen_args_prefers_request_and_environment_to_config(monkeypatch):
     monkeypatch.delenv("MLX_VLM_THINKING_START_TOKEN", raising=False)
     monkeypatch.delenv("MLX_VLM_THINKING_END_TOKEN", raising=False)
