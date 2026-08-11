@@ -17,13 +17,26 @@ _CONTENT_MARKERS = ("<|START_TEXT|>", "<|END_TEXT|>")
 _HARMONY_START_MARKER = "<|start|>"
 _HARMONY_MESSAGE_MARKER = "<|message|>"
 _HARMONY_CHANNEL_HEADER = re.compile(r"<\|start\|>[^<]*?<\|message\|>")
+_HARMONY_BARE_HEADER = re.compile(r"^\s*to=[^<\s]*<\|message\|>")
 _CONTENT_END_MARKERS = ("<|eom|>", "<|eot|>")
 
 
 def _strip_content_markers(text: str) -> str:
     for marker in _CONTENT_MARKERS + _CONTENT_END_MARKERS:
         text = text.replace(marker, "")
-    return _HARMONY_CHANNEL_HEADER.sub("", text)
+    text = _HARMONY_CHANNEL_HEADER.sub("", text)
+    return _HARMONY_BARE_HEADER.sub("", text, count=1)
+
+
+def _could_be_bare_header(text: str) -> bool:
+    """Whether text can still grow into a bare ``to=...<|message|>`` header."""
+    head = text.lstrip()
+    if not head.startswith("to="):
+        return "to=".startswith(head)
+    recipient, angle, marker = head[len("to=") :].partition("<")
+    if any(char.isspace() for char in recipient):
+        return False
+    return not angle or _HARMONY_MESSAGE_MARKER.startswith("<" + marker)
 
 
 @dataclass
@@ -64,12 +77,17 @@ class ThinkingStreamState:
         self.in_thinking = bool(enable_thinking)
         self.thinking_done = False
         self.buffer = ""
+        self.at_generation_start = True
 
     def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
         self.buffer += text or ""
         reasoning = []
         content = []
         thinking_closed = False
+
+        if self.at_generation_start and not self.in_thinking:
+            if self._hold_for_header(last):
+                return ThinkingStreamDelta()
 
         while self.buffer:
             if self.in_thinking:
@@ -128,6 +146,27 @@ class ThinkingStreamState:
             content="".join(content) or None,
             thinking_closed=thinking_closed,
         )
+
+    def _hold_for_header(self, last: bool) -> bool:
+        """Drop the bare Harmony header the model opens with when it skips reasoning.
+
+        Returns True while the buffer should be held back, because what has
+        arrived so far could still turn into a thinking marker or a header.
+        """
+        head = self.buffer.lstrip()
+        if any(head.startswith(marker) for marker in self.open_markers):
+            self.at_generation_start = False
+            return False
+        if not last and head and any(m.startswith(head) for m in self.open_markers):
+            return True
+
+        stripped = _HARMONY_BARE_HEADER.sub("", self.buffer, count=1)
+        if stripped == self.buffer and not last and _could_be_bare_header(self.buffer):
+            return True
+
+        self.buffer = stripped
+        self.at_generation_start = False
+        return False
 
     @classmethod
     def _build_open_close_markers(
