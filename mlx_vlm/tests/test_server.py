@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import numpy as np
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -27,6 +28,8 @@ from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.models.pooling import read_prompts_config
+from mlx_vlm.server import embeddings
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
@@ -6833,3 +6836,145 @@ class TestCountThinkingTagTokens:
 
     def test_no_tags(self):
         assert server._count_thinking_tag_tokens("plain text") == 0
+
+
+class TestEmbeddingPrompts:
+    """Tests for named Sentence Transformers prompts on /v1/embeddings."""
+
+    @staticmethod
+    def _model(prompts=None):
+        return SimpleNamespace(prompts=prompts)
+
+    def test_no_prompt_name_prepends_nothing(self):
+        model = self._model({"query": "query: "})
+
+        assert embeddings._resolve_prompt(model, None) == ""
+
+    def test_prompt_name_resolves_to_its_prefix(self):
+        model = self._model({"query": "query: ", "passage": "passage: "})
+
+        assert embeddings._resolve_prompt(model, "passage") == "passage: "
+
+    def test_unknown_prompt_name_lists_what_is_available(self):
+        model = self._model({"query": "query: ", "passage": "passage: "})
+
+        with pytest.raises(ValueError, match="passage, query"):
+            embeddings._resolve_prompt(model, "document")
+
+    def test_prompt_name_on_a_model_without_prompts_is_rejected(self):
+        with pytest.raises(ValueError, match="Available: none"):
+            embeddings._resolve_prompt(self._model(None), "query")
+
+    def test_prompt_is_prepended_to_every_text(self):
+        seen = {}
+
+        class Tokenizer:
+            model_max_length = 512
+
+            def __call__(self, texts, **kwargs):
+                seen["texts"] = texts
+                return {
+                    "input_ids": np.zeros((len(texts), 2), dtype=np.int32),
+                    "attention_mask": np.ones((len(texts), 2), dtype=np.int32),
+                }
+
+        def model(input_ids, attention_mask=None):
+            return SimpleNamespace(text_embeds=mx.zeros((input_ids.shape[0], 4)))
+
+        embeddings._embed(
+            model, SimpleNamespace(tokenizer=Tokenizer()), ["a", "b"], "query: "
+        )
+
+        assert seen["texts"] == ["query: a", "query: b"]
+
+    def test_read_prompts_config_reads_the_prompts_dict(self, tmp_path):
+        (tmp_path / "config_sentence_transformers.json").write_text(
+            json.dumps(
+                {"prompts": {"query": "query: "}, "default_prompt_name": "query"}
+            )
+        )
+
+        assert read_prompts_config(tmp_path) == {"query": "query: "}
+
+    def test_read_prompts_config_returns_none_when_absent(self, tmp_path):
+        assert read_prompts_config(tmp_path) is None
+
+    def test_read_prompts_config_returns_none_without_a_prompts_dict(self, tmp_path):
+        (tmp_path / "config_sentence_transformers.json").write_text(
+            json.dumps({"default_prompt_name": "query"})
+        )
+
+        assert read_prompts_config(tmp_path) is None
+
+    @staticmethod
+    def _client(seen, prompts):
+        """Mount the real /v1/embeddings route with a stub model behind it."""
+
+        class Tokenizer:
+            model_max_length = 512
+
+            def __call__(self, texts, **kwargs):
+                seen["texts"] = texts
+                return {
+                    "input_ids": np.zeros((len(texts), 2), dtype=np.int32),
+                    "attention_mask": np.ones((len(texts), 2), dtype=np.int32),
+                }
+
+        class Model:
+            def __init__(self):
+                self.prompts = prompts
+
+            def __call__(self, input_ids, attention_mask=None):
+                return SimpleNamespace(text_embeds=mx.zeros((input_ids.shape[0], 4)))
+
+        app = FastAPI()
+        deps = SimpleNamespace(
+            get_cached_model=lambda *a, **k: (
+                Model(),
+                SimpleNamespace(tokenizer=Tokenizer()),
+                None,
+                None,
+            ),
+            build_metrics_envelope=lambda **kwargs: kwargs,
+        )
+        embeddings.register_routes(app, deps)
+        return TestClient(app)
+
+    def test_endpoint_applies_the_named_prompt(self):
+        seen = {}
+        client = self._client(seen, {"query": "query: "})
+
+        response = client.post(
+            "/v1/embeddings",
+            json={
+                "input": "capital of France",
+                "model": "demo",
+                "prompt_name": "query",
+            },
+        )
+
+        assert response.status_code == 200
+        assert seen["texts"] == ["query: capital of France"]
+
+    def test_endpoint_leaves_input_alone_without_a_prompt_name(self):
+        seen = {}
+        client = self._client(seen, {"query": "query: "})
+
+        response = client.post(
+            "/v1/embeddings", json={"input": "capital of France", "model": "demo"}
+        )
+
+        assert response.status_code == 200
+        assert seen["texts"] == ["capital of France"]
+
+    def test_endpoint_rejects_an_unknown_prompt_name(self):
+        seen = {}
+        client = self._client(seen, {"query": "query: "})
+
+        response = client.post(
+            "/v1/embeddings",
+            json={"input": "text", "model": "demo", "prompt_name": "nope"},
+        )
+
+        assert response.status_code == 400
+        assert "query" in response.json()["detail"]

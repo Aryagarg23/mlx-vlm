@@ -137,3 +137,13 @@ def read_pooling_config(model_dir):
         return None
     with open(path) as f:
         return json.load(f)
+
+
+def read_prompts_config(model_dir):
+    """Read the named prompts a Sentence Transformers model ships with."""
+    path = Path(model_dir) / "config_sentence_transformers.json"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        prompts = json.load(f).get("prompts")
+    return prompts if isinstance(prompts, dict) else None

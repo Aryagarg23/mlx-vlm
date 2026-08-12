@@ -21,6 +21,26 @@ class EmbeddingsRequest(BaseModel):
     input: Union[str, Dict[str, Any], List[InputItem]]
     model: Optional[str] = None
     encoding_format: Optional[str] = "float"
+    prompt_name: Optional[str] = None
+
+
+def _resolve_prompt(model, prompt_name: Optional[str]) -> str:
+    """Look up a named prompt from the model's Sentence Transformers config.
+
+    Nothing is prepended unless the caller asks for it: the same text is a
+    query in one request and a passage in the next, and only the caller knows
+    which.
+    """
+    if prompt_name is None:
+        return ""
+    prompts = getattr(model, "prompts", None) or {}
+    if prompt_name not in prompts:
+        available = ", ".join(sorted(prompts)) or "none"
+        raise ValueError(
+            f"Unknown prompt_name {prompt_name!r} for this model. "
+            f"Available: {available}."
+        )
+    return prompts[prompt_name]
 
 
 def _default_embedding_model() -> Optional[str]:
@@ -64,7 +84,9 @@ def _normalize_input(value: Union[InputItem, List[InputItem]]) -> List[Tuple[str
     return items
 
 
-def _embed(model, processor, texts: List[str]):
+def _embed(model, processor, texts: List[str], prompt: str = ""):
+    if prompt:
+        texts = [prompt + text for text in texts]
     tok = getattr(processor, "tokenizer", processor)
     max_length = min(int(getattr(tok, "model_max_length", 512) or 512), 8192)
     enc = tok(
@@ -111,14 +133,14 @@ def _embed_image(model, processor, image_url: str):
     return embeds[0].tolist(), tokens
 
 
-def _embed_items(model, processor, items: List[Tuple[str, str]]):
+def _embed_items(model, processor, items: List[Tuple[str, str]], prompt: str = ""):
     vectors: List[Any] = [None] * len(items)
     prompt_tokens = 0
     for index, (kind, value) in enumerate(items):
         if kind == "image":
             vector, tokens = _embed_image(model, processor, value)
         else:
-            batch, tokens = _embed(model, processor, [value])
+            batch, tokens = _embed(model, processor, [value], prompt)
             vector = batch[0]
         vectors[index] = vector
         prompt_tokens += tokens
@@ -151,9 +173,12 @@ def register_routes(app, deps):
                 model, processor, *_ = get_cached_model(
                     model_id, model_kind="embedding"
                 )
+                prompt = _resolve_prompt(model, body.prompt_name)
                 if all(kind == "text" for kind, _ in items):
-                    return _embed(model, processor, [value for _, value in items])
-                return _embed_items(model, processor, items)
+                    return _embed(
+                        model, processor, [value for _, value in items], prompt
+                    )
+                return _embed_items(model, processor, items, prompt)
 
             vectors, prompt_tokens = await asyncio.to_thread(_work)
         except ValueError as exc:

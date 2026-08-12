@@ -657,7 +657,7 @@ def get_cached_model(
             )
         logger.info("Loading embedding model: %s", model_path)
         from ..embedding_loader import load_embedding_model
-        from ..models.pooling import read_pooling_config
+        from ..models.pooling import read_pooling_config, read_prompts_config
         from ..utils import get_model_path, load_processor
 
         try:
@@ -681,6 +681,7 @@ def get_cached_model(
                 status_code=500, detail=f"Failed to load embedding model: {e}"
             ) from e
         model.pooling_config = read_pooling_config(model_dir)
+        model.prompts = read_prompts_config(model_dir)
         config = SimpleNamespace(
             model_type=getattr(model, "model_type", "embedding"),
             text_config=None,
